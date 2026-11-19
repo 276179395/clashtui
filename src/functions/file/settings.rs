@@ -162,12 +162,12 @@ fn merge_settings(content: &str, core: CoreType, runtime: &ClashConfig) -> Resul
                 "default_mode".to_owned(),
                 runtime.mode.to_string().to_lowercase().into(),
             );
-            if let Some(allow) = runtime.allow_lan {
-                if let Some(inbounds) = value.get_mut("inbounds").and_then(|v| v.as_array_mut()) {
-                    for inbound in inbounds {
-                        if matches!(inbound["type"].as_str(), Some("mixed" | "http" | "socks")) {
-                            inbound["listen"] = if allow { "0.0.0.0" } else { "127.0.0.1" }.into();
-                        }
+            if let Some(allow) = runtime.allow_lan
+                && let Some(inbounds) = value.get_mut("inbounds").and_then(|v| v.as_array_mut())
+            {
+                for inbound in inbounds {
+                    if matches!(inbound["type"].as_str(), Some("mixed" | "http" | "socks")) {
+                        inbound["listen"] = if allow { "0.0.0.0" } else { "127.0.0.1" }.into();
                     }
                 }
             }
