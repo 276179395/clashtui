@@ -18,6 +18,7 @@ mod_agent!(
         ([KeyCode::Char('h')], Key::Parent, "Go to parent"),
         ([KeyCode::Char('l')], Key::Expand, "Expand/Jump to group"),
         ([KeyCode::Enter], Key::Select, "Select"),
+        ([KeyCode::Char('w')], Key::Save, "Write proxy selections"),
         (
             [KeyCode::Char('g'), KeyCode::Char('g')],
             Key::GoTop,
@@ -84,6 +85,7 @@ pub enum Key {
     Parent,
     Expand,
     Select,
+    Save,
     GoTop,
     GoBottom,
     CollapseAll,

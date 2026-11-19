@@ -14,6 +14,9 @@ pub struct Proxies {
     pub jump_target: Cell<Option<usize>>,
     pub filter: Option<String>,
     pub paused: bool,
+    pub(super) pending_selections: std::collections::BTreeMap<String, String>,
+    pub(super) selected_and_saved: bool,
+    pub(super) selection_busy: bool,
 }
 
 type SelectionKey = (String, Option<String>, NodeType);
@@ -83,6 +86,7 @@ impl Proxies {
         let current = state.selected().unwrap_or(0);
 
         match key {
+            super::Key::Save => self.save_selections(task_set),
             super::Key::MoveUp => {
                 if current > 0 {
                     state.select(Some(current - 1));

@@ -1,4 +1,4 @@
-use super::dev::*;
+use super::{SaveStatus, dev::*};
 use crate::config::CONFIG;
 use ratatui::{
     layout::{Constraint, Layout},
@@ -13,6 +13,7 @@ mod_agent!(
     SettingsKey,
     [
         ([KeyCode::Enter], SettingsKey::Execute, "Apply"),
+        ([KeyCode::Char('w')], SettingsKey::Save, "Write core config"),
         ([KeyCode::Esc], SettingsKey::Esc, "Back"),
         ([KeyCode::Up], SettingsKey::MoveUp, "Move up"),
         ([KeyCode::Down], SettingsKey::MoveDown, "Move down"),
@@ -23,6 +24,7 @@ mod_agent!(
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SettingsKey {
+    Save,
     Execute,
     MoveUp,
     MoveDown,
@@ -39,6 +41,7 @@ impl TryFrom<&crate::tui::Key> for SettingsKey {
         }
         Ok(match ev.code {
             KeyCode::Enter => Self::Execute,
+            KeyCode::Char('w') => Self::Save,
             KeyCode::Esc => Self::Esc,
             KeyCode::Up | KeyCode::Char('k') => Self::MoveUp,
             KeyCode::Down | KeyCode::Char('j') => Self::MoveDown,
@@ -77,6 +80,9 @@ impl SettingsOp {
 
 #[derive(Default)]
 struct SettingsContent {
+    busy: bool,
+    save_status: Option<SaveStatus>,
+    ready: bool,
     ops: Vec<SettingsOp>,
     current_mode: String,
     allow_lan: bool,
@@ -144,6 +150,7 @@ impl TabContent for SettingsContent {
                         .map(|t| t.stack.to_string())
                         .unwrap_or_else(|| "Mixed".to_owned());
                     wrapper(move |c: &mut SettingsContent| {
+                        c.ready = true;
                         c.current_mode = mode;
                         c.allow_lan = allow_lan;
                         c.tun_enable = tun_enable;
@@ -165,6 +172,32 @@ impl TabContent for SettingsContent {
         task_set: &mut FutureSet<Self>,
         state: &mut Self::State,
     ) {
+        if self.busy || crate::config::is_core_mismatch() {
+            return;
+        }
+        if matches!(key, SettingsKey::Save) {
+            if !self.ready {
+                Confirm::err("Settings have not been loaded; reopen the TUI and try again");
+                return;
+            }
+            self.busy = true;
+            async move {
+                let result = tokio::task::spawn_blocking(crate::functions::file::settings::save)
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|result| result);
+                wrapper(move |c: &mut SettingsContent| {
+                    c.busy = false;
+                    match result {
+                        Ok(()) => c.save_status = Some(SaveStatus::Saved),
+                        Err(e) => Confirm::err(e),
+                    }
+                })
+            }
+            .spawn_at(task_set);
+            return;
+        }
+
         if self.mode_selector_visible {
             match key {
                 SettingsKey::MoveUp => {
@@ -177,6 +210,7 @@ impl TabContent for SettingsContent {
                         self.mode_selector_state.select(Some(i + 1));
                     }
                 }
+                SettingsKey::Save => unreachable!(),
                 SettingsKey::Esc => {
                     self.mode_selector_visible = false;
                 }
@@ -185,9 +219,10 @@ impl TabContent for SettingsContent {
                     if let Some(mode) = self.modes.get(idx) {
                         let mode = *mode;
                         self.mode_selector_visible = false;
+                        self.busy = true;
                         async move {
                             if crate::config::is_core_mismatch() {
-                                return do_nothing();
+                                return wrapper(|c: &mut SettingsContent| c.busy = false);
                             }
                             let payload = serde_json::json!({"mode": mode.to_string()}).to_string();
                             let result = tokio::task::spawn_blocking(move || {
@@ -199,12 +234,16 @@ impl TabContent for SettingsContent {
                                 Ok(_) => {
                                     let new_val = mode.to_string();
                                     wrapper(move |c: &mut SettingsContent| {
+                                        c.busy = false;
+                                        if c.current_mode != new_val {
+                                            c.save_status = Some(SaveStatus::Unsaved);
+                                        }
                                         c.current_mode = new_val;
                                     })
                                 }
                                 Err(e) => {
                                     Confirm::err(e);
-                                    do_nothing()
+                                    wrapper(|c: &mut SettingsContent| c.busy = false)
                                 }
                             }
                         }
@@ -227,6 +266,7 @@ impl TabContent for SettingsContent {
                         self.tun_selector_state.select(Some(i + 1));
                     }
                 }
+                SettingsKey::Save => unreachable!(),
                 SettingsKey::Esc => {
                     self.tun_selector_visible = false;
                 }
@@ -235,9 +275,10 @@ impl TabContent for SettingsContent {
                     if let Some(stack) = self.tun_stacks.get(idx) {
                         let stack = *stack;
                         self.tun_selector_visible = false;
+                        self.busy = true;
                         async move {
                             if crate::config::is_core_mismatch() {
-                                return do_nothing();
+                                return wrapper(|c: &mut SettingsContent| c.busy = false);
                             }
                             let payload = serde_json::json!({"tun": {"stack": stack.to_string()}})
                                 .to_string();
@@ -250,12 +291,16 @@ impl TabContent for SettingsContent {
                                 Ok(_) => {
                                     let new_val = stack.to_string();
                                     wrapper(move |c: &mut SettingsContent| {
+                                        c.busy = false;
+                                        if c.tun_stack != new_val {
+                                            c.save_status = Some(SaveStatus::Unsaved);
+                                        }
                                         c.tun_stack = new_val;
                                     })
                                 }
                                 Err(e) => {
                                     Confirm::err(e);
-                                    do_nothing()
+                                    wrapper(|c: &mut SettingsContent| c.busy = false)
                                 }
                             }
                         }
@@ -287,9 +332,10 @@ impl TabContent for SettingsContent {
                     SettingsOp::AllowLan => {
                         let new_val = !self.allow_lan;
                         self.allow_lan = new_val;
+                        self.busy = true;
                         async move {
                             if crate::config::is_core_mismatch() {
-                                return do_nothing();
+                                return wrapper(|c: &mut SettingsContent| c.busy = false);
                             }
                             let payload = serde_json::json!({"allow-lan": new_val}).to_string();
                             let result = tokio::task::spawn_blocking(move || {
@@ -299,11 +345,14 @@ impl TabContent for SettingsContent {
                             .unwrap();
                             match result {
                                 Ok(_) => wrapper(move |c: &mut SettingsContent| {
+                                    c.busy = false;
+                                    c.save_status = Some(SaveStatus::Unsaved);
                                     c.allow_lan = new_val;
                                 }),
                                 Err(e) => {
                                     Confirm::err(e);
                                     wrapper(move |c: &mut SettingsContent| {
+                                        c.busy = false;
                                         c.allow_lan = !new_val;
                                     })
                                 }
@@ -314,9 +363,10 @@ impl TabContent for SettingsContent {
                     SettingsOp::TunEnable => {
                         let new_val = !self.tun_enable;
                         self.tun_enable = new_val;
+                        self.busy = true;
                         async move {
                             if crate::config::is_core_mismatch() {
-                                return do_nothing();
+                                return wrapper(|c: &mut SettingsContent| c.busy = false);
                             }
                             let payload =
                                 serde_json::json!({"tun": {"enable": new_val}}).to_string();
@@ -327,11 +377,14 @@ impl TabContent for SettingsContent {
                             .unwrap();
                             match result {
                                 Ok(_) => wrapper(move |c: &mut SettingsContent| {
+                                    c.busy = false;
+                                    c.save_status = Some(SaveStatus::Unsaved);
                                     c.tun_enable = new_val;
                                 }),
                                 Err(e) => {
                                     Confirm::err(e);
                                     wrapper(move |c: &mut SettingsContent| {
+                                        c.busy = false;
                                         c.tun_enable = !new_val;
                                     })
                                 }
@@ -418,6 +471,8 @@ impl TabContent for SettingsContent {
             f.render_widget(widget, area);
             return;
         }
+
+        let block = super::with_save_status(block, self.save_status);
 
         let value_style = Theme::get().section("settings").muted;
 
@@ -530,6 +585,8 @@ mod tests {
     fn settings_key_agent_contains_expected() {
         let a = agent();
         assert!(a.contains_key(&mk_key(KeyCode::Enter)));
+        assert!(a.contains_key(&mk_key(KeyCode::Char('w'))));
+        assert!(!a.contains_key(&mk_key(KeyCode::Char(':'))));
         assert!(a.contains_key(&mk_key(KeyCode::Esc)));
         assert!(a.contains_key(&mk_key(KeyCode::Up)));
         assert!(a.contains_key(&mk_key(KeyCode::Down)));

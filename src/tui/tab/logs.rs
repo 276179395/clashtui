@@ -1,4 +1,4 @@
-use super::dev::*;
+use super::{SaveStatus, dev::*};
 use crate::config::CONFIG;
 use crate::functions::restful::api_log::{self, LogEntry};
 use crate::functions::restful::config;
@@ -27,6 +27,7 @@ mod_agent!(
         ([KeyCode::Char('p')], Key::TogglePause, "Pause/Resume"),
         ([KeyCode::Char('f')], Key::FzfFind, "Find"),
         ([KeyCode::Char('c')], Key::Clear, "Clear logs"),
+        ([KeyCode::Char('w')], Key::Save, "Write core log level"),
         (
             [KeyCode::Char('t'), KeyCode::Char('d')],
             Key::ToggleDebug,
@@ -65,6 +66,7 @@ pub enum Key {
     TogglePause,
     FzfFind,
     Clear,
+    Save,
     ToggleDebug,
     ToggleInfo,
     ToggleWarning,
@@ -146,6 +148,8 @@ impl Default for Logs {
             filter: None,
             paused: true,
             current_log_level: String::new(),
+            save_status: None,
+            saving: false,
             ws_pending: None,
             ws_level: Arc::new(Mutex::new(String::new())),
             ws_reconnect: Arc::new(AtomicBool::new(false)),
@@ -160,6 +164,8 @@ struct Logs {
     filter: Option<String>,
     paused: bool,
     current_log_level: String,
+    save_status: Option<SaveStatus>,
+    saving: bool,
     ws_pending: Option<Arc<Mutex<Vec<LogEntry>>>>,
     ws_level: Arc<Mutex<String>>,
     ws_reconnect: Arc<AtomicBool>,
@@ -274,7 +280,7 @@ impl BasicTabContent for Logs {
                 or_set
             );
             wrapper(move |content: &mut Self| {
-                if crate::config::is_core_mismatch() {
+                if content.save_status.is_some() || crate::config::is_core_mismatch() {
                     return;
                 }
                 let level = cfg
@@ -335,7 +341,7 @@ impl TabContent for Logs {
                 or_set
             );
             wrapper(move |content: &mut Self| {
-                if crate::config::is_core_mismatch() {
+                if content.save_status.is_some() || crate::config::is_core_mismatch() {
                     return;
                 }
                 let level = cfg
@@ -422,6 +428,7 @@ impl TabContent for Logs {
                 self.scroll = 0;
                 self.filter = None;
             }
+            Key::Save => self.save_log_level(task_set),
             Key::ToggleDebug => self.toggle_log_level("debug", task_set),
             Key::ToggleInfo => self.toggle_log_level("info", task_set),
             Key::ToggleWarning => self.toggle_log_level("warning", task_set),
@@ -448,6 +455,8 @@ impl TabContent for Logs {
         } else {
             block
         };
+
+        let block = super::with_save_status(block, self.save_status);
 
         if !self.error.as_deref().unwrap_or("").is_empty() && self.buffer.is_empty() {
             let widget =
@@ -476,10 +485,35 @@ impl TabContent for Logs {
 }
 
 impl Logs {
-    fn toggle_log_level(&mut self, level: &str, _task_set: &mut FutureSet<Self>) {
-        if crate::config::is_core_mismatch() {
+    fn save_log_level(&mut self, task_set: &mut FutureSet<Self>) {
+        if self.saving || !matches!(self.save_status, Some(SaveStatus::Unsaved)) {
             return;
         }
+        self.saving = true;
+        let level = self.current_log_level.clone();
+        async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::functions::file::settings::save_log_level(&level)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+            wrapper(move |content: &mut Self| {
+                content.saving = false;
+                match result {
+                    Ok(()) => content.save_status = Some(SaveStatus::Saved),
+                    Err(e) => Confirm::err(e),
+                }
+            })
+        }
+        .spawn_at(task_set);
+    }
+
+    fn toggle_log_level(&mut self, level: &str, _task_set: &mut FutureSet<Self>) {
+        if self.saving || crate::config::is_core_mismatch() {
+            return;
+        }
+        self.save_status = Some(SaveStatus::Unsaved);
         let level = level.to_owned();
         self.current_log_level = level.clone();
         *self.ws_level.lock().unwrap() = level;

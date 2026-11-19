@@ -35,35 +35,76 @@ impl Proxies {
 
 impl Proxies {
     pub fn select_inline(&mut self, group: String, node: String, task_set: &mut FutureSet<Self>) {
-        let t_secs = crate::config::CONFIG.cfg_file.timeout.unwrap_or(5).max(1) + 3;
+        if self.selection_busy {
+            return;
+        }
+        self.selection_busy = true;
+        let is_selector = self
+            .proxies
+            .primary
+            .get(&group)
+            .is_some_and(|proxy| proxy.proxy_type.eq_ignore_ascii_case("selector"));
         self.error = Some(format!("Switching to {node}..."));
         self.testing_since = Some(Instant::now());
         async move {
-            tri!(
-                tokio::task::spawn_blocking(move || { proxies::select_proxy(&group, &node) })
-                    .await
-                    .unwrap(),
-                or_cancel
-            );
-            let response = match tokio::time::timeout(
-                Duration::from_secs(t_secs),
-                tokio::task::spawn_blocking(proxies::fetch_proxies),
-            )
+            let selected = tokio::task::spawn_blocking(move || {
+                proxies::select_proxy(&group, &node)?;
+                Ok::<_, minreq::Error>((group, node))
+            })
             .await
-            {
-                Ok(Ok(Ok(r))) => r,
-                _ => {
-                    return wrapper(move |content: &mut Self| {
-                        content.error = None;
-                        content.testing_since = None;
-                    });
-                }
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result.map_err(Into::into));
+            let response = if selected.is_ok() {
+                tokio::task::spawn_blocking(proxies::fetch_proxies)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            } else {
+                None
             };
             wrapper(move |content: &mut Self| {
-                content.proxies = response;
-                content.tree.rebuild_from_proxies(&content.proxies);
+                content.selection_busy = false;
                 content.error = None;
                 content.testing_since = None;
+                match selected {
+                    Ok((group, node)) if is_selector => {
+                        content.pending_selections.insert(group, node);
+                        content.selected_and_saved = false;
+                    }
+                    Ok(_) => {}
+                    Err(e) => Confirm::err(e),
+                }
+                if let Some(response) = response {
+                    content.proxies = response;
+                    content.tree.rebuild_from_proxies(&content.proxies);
+                }
+            })
+        }
+        .spawn_at(task_set);
+    }
+
+    pub(super) fn save_selections(&mut self, task_set: &mut FutureSet<Self>) {
+        if self.selection_busy || self.pending_selections.is_empty() {
+            return;
+        }
+        let selections = self.pending_selections.clone();
+        self.selection_busy = true;
+        async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::functions::file::settings::save_proxy_selections(&selections)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+            wrapper(move |content: &mut Self| {
+                content.selection_busy = false;
+                match result {
+                    Ok(()) => {
+                        content.pending_selections.clear();
+                        content.selected_and_saved = true;
+                    }
+                    Err(e) => Confirm::err(e),
+                }
             })
         }
         .spawn_at(task_set);
